@@ -1,18 +1,19 @@
-# Hermes Agent 软件工程团队系统设计方案 v1.7
+# Hermes Agent 软件工程团队系统设计方案 v2.0
 
 ## 1. 结论摘要
 
-本方案建议采用 **Hermes Orchestrated Agent Team** 架构：
+Hermes Agent 软件工程团队应设计为一个 **状态机驱动、产物可追溯、执行可隔离、人工门禁可审计** 的长周期软件工程编排系统。
+
+它不是多 Agent 自由聊天平台，也不是 Claude Code CLI 的简单包装器，而是：
 
 ```text
-Hermes 状态机 + 任务队列 + 产物管理 + 评审门禁
-  + Claude Code CLI Runner
-  + 飞书 PM 入口
-  + 角色 Prompt Agent
-  + 可选 Claude Code Sub-agent 辅助执行
+Hermes 管状态、流程、记忆、任务、产物、评审、异常升级；
+Claude Code CLI / LLM / Script Runner 管代码、文档、测试、安全扫描等具体执行；
+飞书只暴露 PM Agent 给用户；
+WorkflowEngine 是唯一可以推进项目阶段的模块；
+Agent 负责产出和建议，不能直接修改项目状态；
+Runner 负责安全执行，不能参与业务决策。
 ```
-
-不建议第一版采用纯 Sub-agent，也不建议采用 OpenClaw / AutoGen / CrewAI 风格的自由 multi-agent 协商模式作为核心。
 
 核心判断：
 
@@ -21,274 +22,1134 @@ Hermes 状态机 + 任务队列 + 产物管理 + 评审门禁
 而是让项目状态、任务输入、产物、评审和异常升级可恢复、可审计、可重试。
 ```
 
-因此：
-
-- Hermes 负责记忆、状态、流程、任务、产物、评审、异常升级。
-- Claude Code CLI 负责代码、文档、测试、安全扫描等具体执行。
-- 飞书只暴露 PM Agent 给用户。
-- PDM / DEV / TEST / SEC 等角色先以角色 Prompt + Runner 任务实现。
-- WorkflowEngine 是唯一可以推进项目阶段的模块。
-- Agent 不能直接修改项目状态。
-
 ---
 
-## 2. 方案可行性判断
+## 2. 总体架构
 
-### 2.1 可行
-
-从当前设计看，整体方向可行，原因是：
+### 2.1 五层架构
 
 ```text
-1. 以状态机承载长周期项目流程，而不是依赖对话上下文。
-2. 以 Task / TaskRun 承载异步任务执行，适合后台运行。
-3. 以 Artifact 承载 PRD、设计文档、测试清单、代码 diff、报告等产物。
-4. 以 Review / Issue / Escalation 承载评审、问题回流和人工决策。
-5. 以 Runner Worker 封装 Claude Code CLI，避免把 CLI 直接暴露给业务层。
-6. 飞书只作为用户交互入口，降低用户操作复杂度。
+1. 交互层
+   Feishu Bot / Feishu Card / Webhook / 用户确认
+
+2. 编排层
+   PM Interaction Service
+   WorkflowEngine
+   StateTransitionGuard
+   PhaseCommunicationGuard
+   EscalationManager
+   PM Patrol Scheduler
+
+3. 协作层
+   AgentExecutor
+   Agent Registry
+   Role Prompt
+   Review Service
+   Issue Service
+   Agent Message Service
+   Confirmation Service
+
+4. 执行层
+   Task Queue
+   Runner Worker
+   Claude Code CLI Runner
+   Direct LLM Runner
+   Script Runner
+   WorkspaceManager
+   ArtifactCollector
+   LogCollector
+
+5. 状态与产物层
+   SQLite / 后续 Postgres
+   project_events
+   tasks / task_runs
+   artifacts
+   issues
+   reviews
+   confirmations
+   local file storage
+   git workspaces
 ```
 
-### 2.2 最大风险
-
-最大风险不是 Agent 能力，而是工程控制面：
+### 2.2 总体链路
 
 ```text
-1. MVP 范围过大导致迟迟无法跑通闭环。
-2. Runner 权限边界不清导致误改文件、泄露密钥或资源失控。
-3. Agent 自行判断阶段完成导致状态漂移。
-4. 长周期任务缺少输入快照，失败后无法复现。
-5. 多 Agent 自由通信导致责任边界混乱。
-6. 不同规模需求使用同一套重流程，导致小需求交付效率低。
-7. 缺少人工确认门禁时，自动执行可能越过高风险操作边界。
+Feishu User
+  -> Feishu Bot / Interactive Card
+  -> PM Interaction Service
+  -> WorkflowEngine / StateTransitionGuard
+  -> TaskService / ReviewService / IssueService / ConfirmationService
+  -> AgentExecutor
+  -> Task Queue
+  -> Runner Worker
+  -> Claude Code CLI / Direct LLM / Script Runner
+  -> Artifact Store / SQLite / Git Workspace
 ```
 
----
-
-## 3. Sub-agent 与 Multi-agent 模式对比
-
-### 3.1 Claude Code Sub-agent 模式
-
-适合：
+### 2.3 核心边界
 
 ```text
-代码搜索
-局部实现
-代码评审
-并行短任务
-测试补充
-文档整理
-```
-
-优点：
-
-```text
-上下文隔离好；
-适合单次任务内并行；
-对代码仓库理解能力强；
-能保护主会话上下文。
-```
-
-缺点：
-
-```text
-不适合作为长周期项目调度核心；
-生命周期依赖主任务；
-自身不负责项目状态持久化；
-不能替代 WorkflowEngine、TaskQueue、ArtifactStore。
-```
-
-结论：
-
-```text
-Sub-agent 适合作为 Runner 内部能力，不适合作为系统总架构。
-```
-
-### 3.2 OpenClaw / AutoGen / CrewAI 风格 Multi-agent
-
-适合：
-
-```text
-快速原型；
-多角色讨论；
-头脑风暴；
-研究性任务；
-一次性复杂问题求解。
-```
-
-优点：
-
-```text
-角色建模自然；
-多 Agent 协作表达力强；
-容易模拟会议和讨论；
-适合验证协作流程。
-```
-
-缺点：
-
-```text
-状态一致性弱；
-失败恢复复杂；
-长期项目容易上下文漂移；
-难以审计每一步为什么发生；
-容易出现 Agent 之间互相确认但实际产物不合格的情况。
-```
-
-结论：
-
-```text
-Multi-agent 框架可以作为 AgentExecutor 的可选实现，但不建议作为 MVP 核心。
-```
-
-### 3.3 推荐：Hermes 混合编排模式
-
-推荐模式：
-
-```text
-Hermes 管流程；
-Runner 管执行；
-Agent 管产出和评审意见；
-WorkflowEngine 管阶段推进；
-飞书 PM 管用户交互。
-```
-
-该模式的优势：
-
-```text
-1. 长周期项目可恢复。
-2. 每个阶段有明确输入和输出。
-3. 每次执行有 TaskRun 记录。
-4. 每个产物有 Artifact 记录。
-5. 每次失败有 Issue / Escalation 记录。
-6. 用户只需要和 PM 交互。
-7. 后续可以替换或扩展 Agent 执行引擎。
+用户只和 PM 交互；
+PM 负责沟通、汇总、巡检、升级，不直接切状态；
+Agent 负责产出、建议、评审意见、问题单，不直接推进阶段；
+Runner 负责执行，不理解业务阶段和角色决策；
+WorkflowEngine 负责推进阶段；
+StateTransitionGuard 负责防止非法跳转；
+PhaseCommunicationGuard 负责按阶段控制 Agent 间通信；
+Confirmation 负责人工确认；
+Artifact 负责沉淀文档、代码 diff、报告、测试清单；
+project_events 负责审计；
+所有阶段推进必须有 evidence。
 ```
 
 ---
 
-## 4. 角色实现分层
+## 3. 角色体系
 
-### 4.1 必须是真服务 / 真代码模块
+### 3.1 核心流程角色
 
-这些模块不能只靠 LLM Prompt 实现：
-
-| 模块 | 原因 |
-|---|---|
-| PM 交互服务 | 负责飞书消息、用户确认、状态查询和异常升级 |
-| WorkflowEngine | 负责项目阶段推进，必须确定、可审计 |
-| StateTransitionGuard | 防止非法状态跳转 |
-| PhaseCommunicationGuard | 按阶段控制 Agent 间通信权限，满足 DEV/TEST 硬隔离等规则 |
-| TaskService | 负责任务创建、分派、重试、取消 |
-| Runner Worker | 负责调用 Claude Code CLI、收集日志和产物 |
-| WorkspaceManager | 负责隔离 workspace |
-| ArtifactService | 负责产物登记、版本化和查询 |
-| EscalationManager | 负责超过重试阈值后的人工决策 |
-| Feishu Module | 负责飞书事件、卡片、审批交互 |
-
-### 4.2 第一版可以是角色 Prompt + Runner 任务
-
-这些角色第一版不需要独立服务进程：
-
-| Agent | 第一版实现方式 | 说明 |
+| 角色 | 职责 | 主要产物 |
 |---|---|---|
-| PM | Prompt + Runner + 主动巡检调度 | 飞书交互 + 异常升级 + **定时巡检任务超时、阻塞状态，主动推送预警** |
-| PDM | Prompt + Runner | 生成和修订 PRD |
-| DEV | Prompt + Claude Code CLI Runner | 编码、自测、修复缺陷；MVP 同时承担架构设计职责（详细设计文档、接口定义、数据库设计） |
-| TEST | Prompt + Claude Code CLI Runner | 生成测试清单、执行测试、记录问题 |
-| ARCH | 合并到 DEV，MVP 不独立 | 后续版本可拆出独立 ARCH Agent |
-| SEC | Prompt + 脚本扫描任务，可延后 | MVP 可先只保留安全边界，不做完整安全 Agent |
-| RES | Prompt + Runner，按需并行派生 | 技术调研、竞品分析、方案搜索、资料整理，不是第一阶段闭环必需 |
-| Research Judge | ARCH / PM / PDM 兼任 | 汇总多个调研结果，做交叉验证和方案裁决 |
+| PM | 用户交互、项目创建、进度汇总、评审组织、飞书通知、主动巡检、异常升级 | 进度报告、风险汇总、升级卡片 |
+| PDM | 需求澄清、PRD 生成、PRD 修订、需求歧义裁决、验收报告 | PRD、验收报告 |
+| DEV | 编码实现、自测、冒烟、Bug 修复、代码变更总结；MVP 阶段可兼任 ARCH 职责 | diff、源码、自测报告、详细设计 |
+| TEST | 测试用例、测试清单、功能验证、缺陷记录、复测 | 测试用例、测试清单、测试报告、Issue |
 
-### 4.3 Agent 权限边界
+### 3.2 质量增强角色
 
-Agent 只能输出：
+| 角色 | 职责 | 主要产物 |
+|---|---|---|
+| ARCH | 技术方案、接口定义、数据库设计、架构风险识别、设计评审；MVP 阶段可由 DEV 兼任 | 详细设计、接口设计、数据库设计 |
+| SEC | 安全审查、SAST、依赖扫描、敏感信息检查、权限/鉴权审查 | 安全报告、安全 Issue |
 
-```text
-建议
-文档
-评审意见
-执行结果
-问题单
-下一步请求
-```
+### 3.3 按需派生角色
 
-Agent 不能直接执行：
+| 角色 | 职责 | 主要产物 |
+|---|---|---|
+| RES | 技术调研、竞品分析、API/SDK 可行性研究、多方案对比 | 调研报告 |
+| Research Judge | 汇总调研结果、识别冲突、要求补证、给出推荐方案 | 调研裁决报告 |
+
+落地优先级：
 
 ```text
-切换项目阶段
-关闭评审
-创建任意下一阶段任务
-绕过测试结果
-绕过用户确认
-直接修改数据库状态
-直接通知最终完成
+第一优先级：PM / PDM / DEV / TEST
+第二优先级：ARCH / SEC
+第三优先级：RES / Research Judge
 ```
 
-只有 WorkflowEngine 可以：
+### 3.4 Agent 模型独立配置
+
+每个 Agent 独立配置不同厂商模型，统一采用 OpenAI 兼容格式：
+
+```yaml
+agent:
+  name: DEV
+  role: developer
+  executor_type: claude_code_cli
+  model:
+    provider: openai_compatible
+    base_url: "https://api.xxx.com/v1"
+    api_key_env: DEV_MODEL_API_KEY
+    model: "claude-sonnet-4-6"
+    max_tokens: 4096
+    temperature: 0.0
+```
+
+`model_config_json` 存入数据库的结构（OpenAI 兼容格式）：
+
+```json
+{
+  "provider": "openai_compatible",
+  "base_url": "https://api.xxx.com/v1",
+  "api_key_env": "DEV_MODEL_API_KEY",
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 4096,
+  "temperature": 0.0
+}
+```
+
+字段说明：
+- `provider`：模型提供商标识（openai_compatible / anthropic / custom）
+- `base_url`：OpenAI 兼容格式的 API 基础 URL
+- `api_key_env`：环境变量名，**不存储真实 API Key**
+- `model`：模型名称（如 claude-sonnet-4-6、gpt-4o、qwen-plus 等）
+- `max_tokens`：可选，单次请求最大 token 数
+- `temperature`：可选，采样温度，默认 0.0 表示确定性输出
+
+配置原则：
 
 ```text
-切阶段
-创建下一任务
-关闭评审
-触发回流
-触发异常升级
-标记项目完成
+PDM / DEV / ARCH 可优先使用代码和文档能力强的模型；
+TEST / RES 可按成本和多样性选择模型；
+SEC 可结合 LLM 与确定性扫描工具；
+PM 可使用轻量模型负责汇总、通知和状态解释；
+Hermes 自身模型配置与 Agent 执行模型分开管理。
+运行时从环境变量读取 api_key_env 对应的真实 Key，不写入数据库或日志。
 ```
 
-### 4.4 Agent 模型独立配置
+---
 
-每个 Agent 可以独立配置不同厂商的模型，采用 OpenAI 兼容格式（base_url + api_key + model）：
+## 4. Agent 权限边界与协作规则
+
+### 4.1 Agent 允许做
 
 ```text
-PDM  → 可用 Claude（文档质量优先）
-DEV  → 可用 Claude（代码质量优先）
-TEST → 可用 GPT（测试用例多样性）
-SEC  → 可用 DeepSeek（成本优先）
-ARCH → 可用 Claude（架构决策质量优先）
-RES  → 可用成本较低的模型（调研量大）
-PM   → 可用轻量模型（协调为主）
+生成 artifact；
+提交 review comment；
+创建 issue；
+提出 question；
+请求 clarification；
+输出 task result；
+建议下一步动作；
+建议升级给用户；
+建议暂停项目。
 ```
 
-配置存储于 `configs/models.yaml`，agents 表的 `model_config_json` 指向具体配置。Agent 启动时从配置中读取自己的模型参数注入 Runner。
+### 4.2 Agent 禁止做
 
-Hermes 自身的模型配置（WorkflowEngine、PM 交互等）与 Agent 执行模型分开管理，互不影响。
+```text
+直接切换 project phase；
+直接关闭 review；
+直接标记 issue verified；
+直接标记 project done；
+直接绕过测试；
+直接绕过用户确认；
+直接 push / merge / deploy；
+直接执行数据库迁移；
+直接修改 project_events；
+直接写数据库状态。
+```
 
-### 4.5 PhaseCommunicationGuard：按阶段通信隔离
+### 4.3 受控间接协作
 
-在项目中 Agent 之间的通信并非总是允许的。为满足"设计与测试用例准备阶段 DEV 和 TEST 禁止交流"的硬隔离需求，增加 PhaseCommunicationGuard 模块。
+```text
+Agent 之间不直接自由聊天；
+所有跨角色沟通通过 AgentMessage / Issue / ReviewComment / Artifact；
+PM 可以汇总和路由；
+PDM 负责需求歧义裁决；
+ARCH 负责技术方案裁决；
+WorkflowEngine 负责状态推进。
+```
+
+### 4.4 PhaseCommunicationGuard
+
+PhaseCommunicationGuard 按阶段控制 Agent 间通信权限，满足 DEV/TEST 硬隔离等规则。
 
 ```text
 规则：
-  - 每个项目阶段可配置禁止通信的 Agent 对
-  - DESIGN_AND_TESTCASE_PREPARATION 阶段：DEV ↔ TEST 消息直接拒绝
-  - DESIGN_REVIEW 阶段开始后解禁
-  - 被拒绝的消息记录到 agent_messages（status = rejected_by_guard）
-  - PM 巡检可查看被拦截的消息
+  - 每个项目阶段可配置禁止通信的 Agent 对；
+  - DESIGN_AND_TESTCASE_PREPARATION 阶段 DEV ↔ TEST 消息直接拒绝；
+  - DESIGN_REVIEW 阶段开始后解禁；
+  - 被拒绝的消息记录到 agent_messages，status = rejected_by_guard；
+  - PM 巡检可查看被拦截的消息。
 
 实现方式：
-  - agent_messages 发送前经过 PhaseCommunicationGuard.check(from_agent, to_agent, project_phase)
-  - 返回 allowed / rejected + reason
-  - Guard 规则配置于 workflows/phase_communication_rules.yaml
+  - agent_messages 发送前经过 PhaseCommunicationGuard.check(from_agent, to_agent, project_phase)；
+  - 返回 allowed / rejected + reason；
+  - Guard 规则配置于 workflows/phase_communication_rules.yaml。
 ```
 
-Agent 之间的合法通信（如 DEV → PDM 的需求澄清）始终允许，Guard 只阻断特定阶段特定 Agent 对。
-
-### 4.6 按需并行调研机制
-
-RES 不建议设计成固定流程必经角色，而应设计成按需并行派生的调研池。
-
-触发机制：任何阶段、任何 Agent 发现需要调研的问题时，可向 PM 提出调研请求，PM 判断后按需创建 research_task。触发场景包括但不限于：
+DEV 和 TEST 隔离规则：
 
 ```text
-技术选型不明确
-需求存在多种产品方案
-外部 API / SDK 不熟
-需要竞品分析
-需要安全或合规判断
-开发评估发现实现风险
+在 DESIGN_AND_TESTCASE_PREPARATION 阶段：
+DEV / ARCH 负责详细设计；
+TEST 独立生成测试用例和测试清单；
+DEV 和 TEST 不直接点对点沟通；
+需求疑问提交给 PDM；
+技术可测性疑问通过 ReviewComment 在设计评审阶段处理；
+所有沟通必须留下结构化记录。
 ```
 
-不限定具体触发阶段，从需求到开发修复阶段均可触发。
+---
+
+## 5. Workflow 设计
+
+### 5.1 统一阶段枚举
+
+项目阶段（current_phase）与项目状态（status）分离管理：
+- `current_phase`：表达项目当前处于哪个工作阶段（见下方枚举）
+- `status`：active / paused / failed / cancelled / done
+
+项目暂停时，`status='paused'` 但 `current_phase` 保留暂停前的真实阶段，
+恢复时可准确恢复到暂停时的阶段继续执行。
+
+```text
+INIT
+REQUIREMENT_DISCOVERY
+REQUIREMENT_DRAFTING
+REQUIREMENT_REVIEW
+REQUIREMENT_REVISION
+REQUIREMENT_APPROVED
+DESIGN_AND_TESTCASE_PREPARATION
+DESIGN_REVIEW
+DESIGN_REVISION
+DESIGN_APPROVED
+DEVELOPMENT
+DEV_SELF_TEST
+TEST_AND_SECURITY_VALIDATION
+FIXING
+USER_ACCEPTANCE
+ACCEPTANCE_FIXING
+```
+
+SCOPE_CHANGE 不作为 current_phase，也不作为 project.status。
+它是用户或系统触发的变更命令，由 Confirmation / Escalation 承载。
+变更被确认后，WorkflowEngine 根据影响范围创建新的 PRD 修订任务，通常回到 REQUIREMENT_DISCOVERY 或 REQUIREMENT_DRAFTING。
+
+所有 API、DDL、飞书卡片、测试用例、WorkflowEngine 都必须引用这一份阶段枚举。
+
+### 5.2 完整生命周期
+
+```text
+INIT
+  -> REQUIREMENT_DISCOVERY
+  -> REQUIREMENT_DRAFTING
+  -> REQUIREMENT_REVIEW
+  -> REQUIREMENT_REVISION
+  -> REQUIREMENT_APPROVED
+  -> DESIGN_AND_TESTCASE_PREPARATION
+  -> DESIGN_REVIEW
+  -> DESIGN_REVISION
+  -> DESIGN_APPROVED
+  -> DEVELOPMENT
+  -> DEV_SELF_TEST
+  -> TEST_AND_SECURITY_VALIDATION
+  -> FIXING
+  -> USER_ACCEPTANCE
+  -> ACCEPTANCE_FIXING
+  -> DONE
+```
+
+典型直线路径：
+
+```text
+INIT
+  -> REQUIREMENT_DISCOVERY
+  -> REQUIREMENT_DRAFTING
+  -> REQUIREMENT_REVIEW
+  -> REQUIREMENT_APPROVED
+  -> DESIGN_AND_TESTCASE_PREPARATION
+  -> DESIGN_REVIEW
+  -> DESIGN_APPROVED
+  -> DEVELOPMENT
+  -> DEV_SELF_TEST
+  -> TEST_AND_SECURITY_VALIDATION
+  -> USER_ACCEPTANCE
+  -> DONE
+```
+
+问题回流：
+
+```text
+需求评审失败：
+REQUIREMENT_REVIEW -> REQUIREMENT_REVISION -> REQUIREMENT_REVIEW
+
+设计评审失败：
+DESIGN_REVIEW -> DESIGN_REVISION -> DESIGN_REVIEW
+
+测试 / 安全失败：
+TEST_AND_SECURITY_VALIDATION -> FIXING -> DEV_SELF_TEST -> TEST_AND_SECURITY_VALIDATION
+
+用户验收失败（标准路径 - 代码逻辑变更）：
+USER_ACCEPTANCE -> ACCEPTANCE_FIXING -> DEV_SELF_TEST -> TEST_AND_SECURITY_VALIDATION -> USER_ACCEPTANCE
+
+用户验收失败（轻量路径 - 文案/样式/文档类变更）：
+USER_ACCEPTANCE -> ACCEPTANCE_FIXING -> USER_ACCEPTANCE
+```
+
+异常状态：
+
+```text
+任意阶段 -> status=PAUSED（current_phase 保持不变）
+任意阶段 -> status=FAILED（current_phase 保持不变）
+任意阶段 -> status=CANCELLED（current_phase 保持不变）
+任意阶段 -> scope_change command / escalation decision
+  -> 用户确认变更范围
+  -> REQUIREMENT_DISCOVERY 或 REQUIREMENT_DRAFTING
+  -> 生成新版 PRD artifact
+```
+
+需求变更处理规则：
+
+```text
+  - scope change 不直接修改 current_phase 或 status；
+  - Feishu / PM 只提交 change_requirement 命令或 escalation decision；
+  - WorkflowEngine 创建 scope_change_approval confirmation；
+  - 用户确认后，按影响范围回到 REQUIREMENT_DISCOVERY 或 REQUIREMENT_DRAFTING；
+  - 原 PRD / 设计 / 测试用例保留为历史 artifact，新版本通过 parent_artifact_id 关联；
+  - 未确认前，项目可保持原阶段 paused，避免半变更状态。
+```
+
+### 5.3 DESIGN_REVIEW 双评审机制
+
+`DESIGN_REVIEW` 阶段内，WorkflowEngine 同时创建两个独立 Review：
+
+```text
+Review A：详细设计评审
+  - 评审对象：DEV / ARCH 产出的详细设计文档
+  - 参与 Agent：PM、PDM、TEST、SEC、ARCH（如已独立）
+  - 独立投票通过/打回
+
+Review B：测试用例与测试清单评审
+  - 评审对象：TEST 产出的测试用例文档 + 测试清单
+  - 参与 Agent：PM、PDM、DEV、SEC、ARCH（如已独立）
+  - 独立投票通过/打回
+```
+
+两个 Review 各自独立：
+
+```text
+Review A 不通过 -> DEV / ARCH 修订详细设计 -> 重新提交 Review A；
+Review B 不通过 -> TEST 修订测试用例 -> 重新提交 Review B；
+两个 Review 都通过 -> WorkflowEngine 推进到 DESIGN_APPROVED。
+```
+
+### 5.4 回流和超时上限
+
+```text
+需求评审最多 2 轮回流；
+设计评审最多 3 轮回流；
+测试修复最多 3 轮回流；
+验收修复最多 3 轮回流；
+每个 Review 超时按项目规模分级（可配置）：
+  - S 级：15 分钟
+  - M 级：30 分钟
+  - L/XL 级：60 分钟
+超过回流次数限制或 Review 超时后进入 PAUSED，并创建 escalation。
+```
+
+Review 超时后：
+
+```text
+PM 查询尚未提交评审意见的 Agent；
+PM 推送飞书通知用户，列出已提交意见和超时未响应 Agent；
+用户可选择继续等待、跳过未响应 Agent、回退阶段或暂停项目。
+```
+
+PM 巡检消息聚合策略：
+
+```text
+PM 每 15 分钟巡检一次（可配置），但不每次推送消息给用户。
+消息聚合规则：
+  - 30 分钟内相同项目的相同状态问题，不重复推送；
+  - 只有以下情况才主动推送飞书消息：
+    a. 项目状态发生变化（新任务开始、任务完成、任务失败）
+    b. Review 首次超时
+    c. 连续 2 次巡检发现同一任务超时（升级预警）
+    d. 创建 Escalation 需要用户决策
+    e. 等待用户确认且确认即将超时
+  - 用户可通过飞书 /status 命令随时查询项目状态，不受聚合规则限制
+```
+
+### 5.5 阶段推进原则
+
+```text
+只有 WorkflowEngine 可以推进阶段；
+每次推进必须有 evidence；
+evidence 可以是 artifact、review、issue、task_run、confirmation 或 escalation decision；
+每次推进必须写 project_events；
+Agent 输出只能作为 evidence，不能直接作为状态变更；
+MVP 采用“状态快照 + 审计事件”；
+projects.current_phase / projects.status 是当前状态快照；
+project_events 是审计日志，后续可演进为完整 Event Sourcing。
+```
+
+幂等规则：
+
+```text
+  - 所有会导致状态变化的命令必须带 idempotency key；
+  - project_events.event_key 作为状态变更幂等键；
+  - Feishu event_id / open_message_id、confirmation decision、runner complete/fail、review complete 都必须映射到稳定 event_key；
+  - 如果 event_key 已存在，服务返回已有处理结果，不重复推进状态。
+```
+
+---
+
+## 6. 评审机制
+
+评审不采用自由聊天会议，而采用结构化评审。
+
+### 6.1 Review
+
+```text
+review_type
+phase
+input_artifacts
+participants
+required_participants
+round
+status
+deadline
+conclusion
+```
+
+### 6.2 ReviewComment
+
+```text
+reviewer_agent
+comment_type: pass / question / issue / suggestion
+status: open / resolved / accepted / rejected
+severity: minor / major / blocker
+comment
+required_change
+related_artifact
+resolved_by
+resolved_at
+resolution_note
+```
+
+### 6.3 评审通过条件
+
+```text
+所有 required participant 已提交意见；
+没有 blocker / major 级 fail；
+所有 question 已关闭或转成 issue；
+评审 owner 提交 conclusion；
+WorkflowEngine 校验 evidence 后推进阶段。
+```
+
+### 6.4 评审失败条件
+
+```text
+存在 blocker；
+存在 major 且 required_change 未解决；
+核心 artifact 缺失；
+参与角色未完成评审且超过 deadline；
+意见冲突无法收敛。
+```
+
+### 6.5 阶段评审与结果复核边界
+
+`Review` 和 `Result Review` 是两类不同门禁：
+
+```text
+Review：阶段级评审，用于 PRD、详细设计、测试用例、安全方案等阶段产物；
+Result Review：任务级复核，用于判断一次 TaskRun 输出是否满足 Task Contract 和业务语义。
+```
+
+边界原则：
+
+```text
+Review 关注”阶段产物是否可进入下一阶段”；
+Result Review 关注”Runner 的一次执行结果是否可以被任务采纳”；
+TaskRun completed 只能触发 Result Review，不能直接完成 Task；
+Review passed 才能作为 WorkflowEngine 推进阶段的 evidence；
+Result Review passed 只能证明单个任务结果有效，是否推进阶段仍由 WorkflowEngine 综合判断。
+```
+
+### 6.6 验收问题处理规则
+
+PDM 验收时发现的问题统一走 `issues` 表，`source=acceptance`：
+
+```text
+验收问题与测试/安全发现的问题共享 issues 表，但通过 source 字段区分：
+  - source=test：测试工程师发现的功能缺陷
+  - source=security：安全工程师发现的安全漏洞
+  - source=acceptance：PDM 验收时发现的需求符合度问题
+
+验收问题在飞书卡片上标注为”验收问题”，与”测试缺陷”分开展示，
+确保用户能直观区分两类问题的性质和优先级。
+```
+
+验收回流路径选择规则：
+
+```text
+WorkflowEngine 根据验收问题的影响范围判断走哪条回流路径：
+
+标准路径（代码逻辑变更）：
+  - 存在 severity=blocker/major 的验收问题
+  - 或涉及接口变更、数据库变更、鉴权/权限变更
+  - 路径：ACCEPTANCE_FIXING -> DEV_SELF_TEST -> TEST_AND_SECURITY_VALIDATION -> USER_ACCEPTANCE
+
+轻量路径（文案/样式/文档类变更）：
+  - 所有验收问题均为 severity=minor
+  - 且不涉及代码逻辑变更
+  - 路径：ACCEPTANCE_FIXING -> USER_ACCEPTANCE
+```
+
+验收报告结构：
+
+```text
+acceptance_report artifact 包含：
+  - 验收概述：验收时间、验收人、验收范围
+  - 验收结果：passed / failed
+  - 验收问题统计：总数 / blocker / major / minor
+  - 验收问题清单列表（引用 issues 表，source=acceptance）
+  - 验收结论：是否满足 PRD 要求
+  - 后续建议（如有）
+```
+
+验收通过判定标准：
+
+```text
+  - source=acceptance 的 open issue 数量为 0；
+  - 或仅存在 minor 级 issue 且用户通过飞书确认接受；
+  - PDM 提交 acceptance_report 并标记 is_final=true。
+```
+
+---
+
+## 7. Agent 与 Runner 协作模型
+
+### 7.1 基本原则
+
+```text
+Agent 不直接调用 Claude Code CLI；
+Runner 不理解 Agent 角色和业务决策；
+二者通过 TaskService / AgentExecutor / TaskRun / Artifact 间接协作。
+```
+
+推荐链路：
+
+```text
+Agent 提出任务意图
+  -> AgentExecutor 生成 Task Contract
+  -> AgentExecutor 生成 task_prompt.md / task_context.json
+  -> 创建 TaskRun
+  -> Runner 执行
+  -> Runner 做机械约束校验
+  -> Runner 输出 Artifact / Result
+  -> Result Reviewer 做语义复核
+  -> WorkflowEngine 根据 evidence 推进
+```
+
+### 7.2 Task Contract
+
+Agent 意图必须被编译成可执行契约，而不是只传一句自然语言指令。
+
+Task Contract 包含：
+
+```text
+task_goal
+role
+phase
+input_artifacts
+must_read_artifacts
+allowed_paths
+forbidden_paths
+expected_artifacts
+acceptance_criteria
+quality_gates
+risk_controls
+review_required
+max_changed_files
+timeout_seconds
+```
+
+示例：
+
+```json
+{
+  "task_goal": "实现账号密码登录接口",
+  "must_read_artifacts": ["prd_final", "design_final", "api_design"],
+  "allowed_paths": ["src/auth/**", "tests/auth/**"],
+  "forbidden_paths": [".env", "deploy/**", "ci/**"],
+  "expected_artifacts": ["diff_patch", "self_test_report"],
+  "acceptance_criteria": [
+    "支持账号密码登录",
+    "密码错误返回统一错误提示",
+    "登录成功返回 token",
+    "新增或更新测试用例",
+    "相关测试通过"
+  ],
+  "risk_controls": [
+    "不要 push",
+    "不要执行数据库迁移",
+    "不要修改 CI/CD"
+  ]
+}
+```
+
+### 7.3 Runner 机械校验
+
+Runner 执行结束后必须检查：
+
+```text
+是否修改了 forbidden_paths；
+是否超出 allowed_paths；
+是否产出了 expected_artifacts；
+是否 exit_code 正常；
+是否输出过大；
+是否触发安全策略；
+是否缺少 output_manifest；
+是否缺少 diff 或报告。
+```
+
+违反契约时，Runner 标记：
+
+```text
+CONTRACT_VIOLATION
+SECURITY_POLICY_BLOCKED
+OUTPUT_MISSING
+```
+
+### 7.4 Result Review
+
+Runner 完成不等于任务通过。
+
+```text
+task_run.status = completed
+不代表 task.status = completed
+```
+
+需要 Result Reviewer 对照 Task Contract、原始需求、diff、报告做语义复核：
+
+```text
+是否满足 acceptance_criteria；
+是否偏离 PRD / design；
+是否漏测；
+是否需要返工；
+是否需要创建 issue。
+```
+
+WorkflowEngine 只认通过验证的 evidence：
+
+```text
+TaskRun completed；
+没有 contract violation；
+required artifacts 存在；
+Result Review passed；
+必要测试 passed；
+必要 issue 已关闭；
+必要人工确认已完成。
+```
+
+### 7.5 Task 状态机
+
+Task 表达业务任务，TaskRun 表达一次执行。Task 状态只能由 TaskService、Runner Worker 回调、Result Review 和 WorkflowEngine 按规则推进。
+
+Task 状态转移：
+
+```text
+pending -> assigned：TaskService 分派 owner_agent / assigned_to。
+assigned -> queued：TaskService 创建 task_contract 和 task_run，并向队列写入 task_run_id。
+queued -> running：Runner Worker 成功领取 task_run 并开始准备 workspace。
+running -> result_pending_review：task_run completed，且 Runner 机械校验未发现 contract violation。
+running -> failed：task_run failed / timeout / cancelled，且达到重试上限或错误不可自动重试。
+result_pending_review -> completed：Result Review passed。
+result_pending_review -> needs_revision：Result Review failed 或 needs_revision。
+needs_revision -> assigned：AgentExecutor 根据 required_changes 生成修订任务或重试任务。
+任意非终态 -> blocked：等待依赖、人工确认或外部条件。
+任意非终态 -> cancelled：项目取消或任务取消。
+```
+
+约束：
+
+```text
+  - task_run.status 不能直接决定 task.status=completed；
+  - task.completed 必须依赖 Result Review passed；
+  - WorkflowEngine 只使用 completed task / passed review / closed issue / approved confirmation 作为推进 evidence。
+```
+
+---
+
+## 8. Runner 设计
+
+### 8.1 Runner 定位
+
+```text
+AgentExecutor 负责决定“谁来做任务”；
+Runner 负责决定“如何安全执行任务”；
+Claude Code CLI 只是 Runner 的一种执行后端。
+```
+
+Runner 标准输入：
+
+```text
+task_prompt.md
+task_context.json
+input_artifacts_manifest.json
+runner_config_snapshot.json
+model_config_snapshot.json
+workspace_config.json
+task_contract.json
+```
+
+Runner 标准输出：
+
+```text
+stdout / stderr
+execution log
+summary
+diff.patch
+artifact manifest
+result.json
+error report
+contract_check_result.json
+```
+
+### 8.2 Runner 生命周期
+
+```text
+CREATED
+  -> PREPARING_WORKSPACE
+  -> BUILDING_CONTEXT
+  -> RUNNING
+  -> COLLECTING_RESULTS
+  -> PARSING_OUTPUT
+  -> COMPLETED / FAILED / TIMEOUT / CANCELLED
+```
+
+执行后端由 `runner_type` 区分：
+
+```text
+claude_code_cli      # MVP 主要使用，代码生成和文档生成
+script_runner        # MVP 使用，Excel 生成/简单脚本测试/SAST 扫描
+direct_llm           # MVP 后使用
+sast_runner          # MVP 后使用
+test_runner          # MVP 后使用
+multi_agent_runner   # MVP 后使用
+```
+
+MVP 阶段只实现 `claude_code_cli` 和 `script_runner` 两种 Runner，
+覆盖编码、文档生成、测试清单 Excel 生成和基本脚本验证场景。
+其他 Runner 类型在后续阶段按需添加，减少初期复杂度。
+
+### 8.2.1 Task Queue / Runner Worker 模型
+
+MVP 推荐使用 Dramatiq + Redis 作为任务队列，SQLite 仍然是业务状态源。
+
+入队时机：
+
+```text
+  - TaskService 创建 task_run 后，将 task.status 置为 queued；
+  - 队列消息只包含 task_run_id，不携带完整上下文；
+  - Runner Worker 领取后从数据库读取 task_run、task_contract、runner_policy 和输入快照路径。
+```
+
+队列消息：
+
+```json
+{
+  "task_run_id": "run_001",
+  "idempotency_key": "task_run:run_001:start"
+}
+```
+
+Worker 并发：
+
+```text
+  - 同一项目同一时间最多一个 DEV 写工作区任务运行；
+  - TEST / SEC 只读任务可以并行；
+  - PDM / PM 文档任务可并行，但同一 artifact 只能有一个最终版标记任务；
+  - Worker 池按 runner_type 设置并发上限。
+```
+
+状态更新责任：
+
+```text
+  - Runner Worker 只更新 task_run.status 和运行输出；
+  - TaskService 根据 Worker 开始执行事件把 task.status 从 queued 推到 running；
+  - Result Review 决定 task.status 是 completed 还是 needs_revision；
+  - WorkflowEngine 根据 evidence 推进 project.current_phase。
+```
+
+重试策略：
+
+```text
+  - 队列框架只负责投递失败重试；
+  - 业务重试次数以 tasks.retry_count / max_retries 为准；
+  - Runner 超时、CLI 非零退出、输出缺失等错误写入 task_runs.error_code；
+  - 达到 max_retries 后创建 escalation，不继续自动重试。
+```
+
+### 8.3 Workspace 策略
+
+| 任务类型 | 策略 | 写权限 |
+|---|---|---|
+| PDM / PM 文档任务 | copy_workspace 或 artifact_workspace | docs / artifacts / reports |
+| DEV 代码任务 | git_worktree | repo workspace，禁止自动 push / merge |
+| TEST 测试任务 | clean_git_worktree | 代码默认只读，reports / artifacts 可写 |
+| SEC 安全任务 | readonly_worktree 或 container readonly mount | security-reports / artifacts |
+| RES 调研任务 | no_repo_workspace 或 readonly_workspace | research reports |
+
+原则：
+
+```text
+每个 task_run 一个独立 workspace；
+同一项目同一时间最多一个 DEV 写工作区；
+TEST / SEC 可以并行读；
+产物目录必须白名单；
+任务结束后收集产物，再决定是否清理 workspace。
+```
+
+### 8.3.1 测试清单 Excel 生成机制
+
+TEST Agent 产出的测试清单需要同时生成两种格式：
+
+```text
+1. Markdown 格式（artifact_type=testcase_doc）：
+   用于评审阶段阅读和结构化解析，存储在 artifacts/ 目录
+   TEST Agent 通过 claude_code_cli 生成 Markdown 文档
+
+2. Excel 格式（artifact_type=test_checklist）：
+   用于逐条执行验证和进度跟踪，存储在 artifacts/ 目录
+   通过 script_runner 调用 Python 脚本，从 testcase_doc 解析并转换为 Excel
+
+转换流程：
+  TEST Agent 生成 testcase_doc Markdown
+    -> WorkflowEngine 解析 Markdown 中的测试用例结构（标题、步骤、预期结果）
+    -> 将解析结果写入 test_checklist_items 表
+    -> script_runner 调用 openpyxl 库生成 Excel 文件
+    -> 登记 artifact (type=test_checklist)
+    -> PM 巡检时从 test_checklist_items 表查询进度（共 N 条，通过 M 条，失败 K 条）
+    -> PDM 验收时可直接查看 Excel 或从系统读取
+
+Excel 文件列结构：
+  序号 | 测试用例标题 | 测试步骤 | 预期结果 | 执行状态 | 实际结果 | 失败描述 | 关联 Issue
+```
+
+MVP 实现策略：
+- `script_runner` 使用预置的 Python 脚本 `generate_test_checklist.py`，读取 testcase_doc Markdown 解析后生成 Excel
+- 依赖 `openpyxl` 库，在 Docker 镜像中预装
+- Markdown 格式采用固定模板，确保解析可靠性
+
+### 8.4 输入快照
+
+每次 TaskRun 启动前必须固化：
+
+```text
+task_id
+project_id
+phase
+owner_agent
+task_contract.json
+task_prompt.md
+task_context.json
+input_artifacts_manifest.json
+repo_url
+repo_commit_sha
+base_branch
+workspace_strategy
+agent_config_snapshot
+model_config_snapshot
+runner_config_snapshot
+created_at
+```
+
+---
+
+## 9. Runner 安全、可靠性与交付门禁
+
+### 9.1 默认禁止动作
+
+```text
+禁止自动 push；
+禁止自动 merge；
+禁止自动创建 PR；
+禁止自动发布；
+禁止自动部署；
+禁止自动执行数据库迁移；
+禁止自动删除远端分支；
+禁止自动修改生产配置；
+禁止自动发送外部消息；
+禁止读取宿主敏感目录；
+禁止把 API Key 写入 prompt、artifact、log。
+```
+
+### 9.2 需要人工确认的动作
+
+```text
+创建 PR；
+推送分支；
+执行 migration；
+新增外部依赖；
+修改 CI/CD；
+修改鉴权 / 权限 / 支付 / 安全策略；
+发布部署；
+删除文件或大规模重构。
+```
+
+确认必须通过飞书卡片或明确用户消息完成，并写入 `confirmations` 与 `project_events`。
+
+### 9.3 Runner Policy 强制机制
+
+Runner 启动前必须加载 `runner_policies` 中启用的策略，并把策略快照写入 `task_runs.runner_policy_id` 与 `runner_config_snapshot_json`。
+
+强制检查点：
+
+```text
+启动前：校验 runner_type、workspace_strategy、allowed_paths、forbidden_paths、env allowlist；
+执行中：限制超时、输出大小、网络访问、子进程数量和危险命令；
+收集前：校验 artifact 路径白名单、大小上限、敏感字符串；
+完成前：校验 diff 是否越权、expected_artifacts 是否齐全、contract_check_result 是否通过。
+```
+
+策略维度：
+
+```text
+command_policy：禁止 push / merge / deploy / migration 等命令；
+network_policy：默认禁止外连，按 runner_type 白名单放行；
+env_policy：只注入任务需要的环境变量，禁止透传宿主完整环境；
+file_policy：只允许访问 workspace 与 artifact 目录；
+artifact_policy：限制 artifact 类型、路径、大小和敏感内容。
+```
+
+违反策略时，Runner 必须停止执行或拒绝收集产物，并写入 `SECURITY_POLICY_BLOCKED` 或 `CONTRACT_VIOLATION`。
+
+### 9.4 可靠性机制
+
+Runner 必须支持：
+
+```text
+timeout；
+取消任务时杀掉子进程；
+最大 stdout / stderr 大小；
+最大 artifact 大小；
+重试上限；
+失败 error_type 分类；
+失败 error_message；
+exit_code；
+workspace_path；
+logs_path；
+diff_path；
+input_snapshot_path；
+output_manifest_path。
+```
+
+错误类型：
+
+```text
+PREPARE_WORKSPACE_FAILED
+BUILD_CONTEXT_FAILED
+RUNNER_TIMEOUT
+RUNNER_CANCELLED
+CLI_EXIT_NONZERO
+OUTPUT_TOO_LARGE
+ARTIFACT_COLLECTION_FAILED
+RESULT_PARSE_FAILED
+SECURITY_POLICY_BLOCKED
+CONTRACT_VIOLATION
+OUTPUT_MISSING
+UNKNOWN_ERROR
+```
+
+### 9.5 日志和密钥保护
+
+```text
+API Key 只从环境变量读取；
+prompt 和 task_context 里只记录 api_key_env，不记录真实 key；
+stdout / stderr 入库或落盘前做脱敏；
+artifact 收集前扫描敏感字符串；
+日志中隐藏 workspace 外部路径；
+错误消息避免带完整环境变量；
+脱敏对象至少包括 API Key、Token、Cookie、Authorization Header、SSH Key、私钥、数据库连接串、Webhook Secret、Feishu App Secret。
+```
+
+### 9.6 取消策略
+
+```text
+用户暂停 / 取消项目时，WorkflowEngine 标记相关 TaskRun cancel_requested_at；
+Runner Worker 收到取消请求后停止接受新输出，向子进程发送终止信号；
+超时未退出时强制杀掉子进程组；
+取消后只收集安全允许的日志和已有产物摘要；
+最终写入 cancelled_at、exit_code、error_code = RUNNER_CANCELLED。
+```
+
+### 9.7 内部 API 与飞书安全
+
+```text
+/internal/runner/* 只允许 Runner Worker 调用；
+内部 Runner API 必须使用服务端 token、mTLS 或内网网关鉴权；
+Runner heartbeat / complete / fail 必须校验 task_run 当前状态，防止重复完成或越权更新；
+Feishu event / interactive 必须校验签名、timestamp 和 app_id；
+Feishu event_id / open_message_id 必须做幂等去重；
+超过时间窗口的飞书回调必须拒绝，防止重放。
+```
+
+---
+
+## 10. 需求规模分级与流程裁剪
+
+### 10.1 S 级
+
+适用：文案修改、配置调整、简单 Bug、局部低风险代码改动。
+
+```text
+需求确认
+  -> DEVELOPMENT
+  -> DEV_SELF_TEST
+  -> TEST_AND_SECURITY_VALIDATION（轻量模式）
+  -> USER_ACCEPTANCE
+  -> DONE
+```
+
+### 10.2 M 级
+
+适用：常规功能、业务规则明确、单仓库或少量模块改动。
+
+```text
+REQUIREMENT_DRAFTING
+  -> REQUIREMENT_REVIEW
+  -> REQUIREMENT_APPROVED
+  -> DEVELOPMENT
+  -> DEV_SELF_TEST
+  -> TEST_AND_SECURITY_VALIDATION
+  -> USER_ACCEPTANCE
+  -> DONE
+```
+
+### 10.3 L 级
+
+适用：涉及数据库 schema、鉴权、权限、支付、安全、跨模块、外部依赖、部署、技术不确定性。
+
+```text
+REQUIREMENT_DISCOVERY
+  -> REQUIREMENT_DRAFTING
+  -> REQUIREMENT_REVIEW
+  -> REQUIREMENT_APPROVED
+  -> DESIGN_AND_TESTCASE_PREPARATION
+  -> DESIGN_REVIEW
+  -> DESIGN_APPROVED
+  -> DEVELOPMENT
+  -> DEV_SELF_TEST
+  -> TEST_AND_SECURITY_VALIDATION
+  -> USER_ACCEPTANCE
+  -> DONE
+```
+
+### 10.4 XL 级
+
+```text
+不允许直接进入开发；
+必须先拆成多个子项目；
+每个子项目独立 PRD / 设计 / 开发 / 测试 / 验收；
+PM 维护父项目进度。
+```
+
+### 10.5 升级到 L 的触发条件
+
+```text
+修改数据库 schema；
+修改鉴权 / 权限 / 支付 / 风控 / 安全逻辑；
+新增外部服务或关键依赖；
+影响 CI/CD、部署、发布；
+跨多个仓库；
+需要迁移历史数据；
+需要线上数据修复；
+需求目标不明确；
+存在多个产品方案；
+测试无法自动验证；
+失败影响范围不可控。
+```
+
+---
+
+## 11. 按需并行调研机制
+
+RES 不作为固定流程必经角色，而是按需并行派生的调研池。
+
+触发场景：
+
+```text
+技术选型不明确；
+需求存在多种产品方案；
+外部 API / SDK 不熟；
+需要竞品分析；
+需要安全或合规判断；
+开发评估发现实现风险。
+```
 
 推荐流程：
 
@@ -302,49 +1163,13 @@ PM / PDM / ARCH 判断需要调研
   -> 作为 PRD 或详细设计输入
 ```
 
-Research Agent 负责独立产出：
-
-```text
-候选方案
-依据来源
-优点
-缺点
-风险
-实现成本
-长期维护成本
-推荐程度
-```
-
-Research Judge 可以由 ARCH、PDM 或 PM 兼任，负责：
-
-```text
-去重和合并多个调研结论
-识别互相矛盾的结论
-要求补充证据
-按评估维度打分
-给出最终推荐方案
-登记 research_report artifact
-```
-
-默认评估维度：
-
-```text
-可行性
-实现成本
-接入复杂度
-安全风险
-长期维护成本
-生态成熟度
-与现有技术栈匹配度
-```
-
 关键原则：
 
 ```text
-多个 Research Agent 可以并行 battle，
-但最终决策不能由调研员投票决定，
-必须由 ARCH / PDM / PM 这类责任角色裁决，
-并由 WorkflowEngine 把 research_report 作为 evidence 进入后续阶段。
+多个 Research Agent 可以并行 battle；
+最终决策不能由调研员投票决定；
+必须由 ARCH / PDM / PM 这类责任角色裁决；
+WorkflowEngine 把 research_report 作为 evidence 进入后续阶段。
 ```
 
 预算和停止条件：
@@ -355,836 +1180,177 @@ Research Judge 可以由 ARCH、PDM 或 PM 兼任，负责：
 每个 Research Agent 必须有时间上限和 token / 成本预算；
 每个调研结论必须给出证据来源或验证依据；
 Research Judge 默认只汇总一轮 battle；
-如果关键分歧无法收敛，升级给 ARCH 或用户决策；
-Research Report 必须明确推荐方案、备选方案和不推荐方案。
+如果关键分歧无法收敛，升级给 ARCH 或用户决策。
 ```
 
 ---
 
-## 5. 需求规模分级与流程裁剪
+## 12. 飞书交互设计
 
-系统不应对所有需求使用同一套重流程。PM / PDM 在项目创建或 PRD 初稿阶段必须先判断需求规模，再由 WorkflowEngine 选择对应流程模板。
+### 12.1 用户入口
 
-### 5.1 分级标准
-
-| 级别 | 适用场景 | 推荐流程 |
-|---|---|---|
-| S | 文案、配置、小 Bug、低风险局部改动 | 轻量需求确认 -> DEV -> 冒烟测试 -> **最小化 TEST 验证（自动化 checklist）** -> 用户确认 |
-| M | 常规功能、明确业务规则、单服务或少量模块改动 | PRD -> DEV -> TEST -> 用户验收 |
-| L | 涉及架构、数据模型、权限、安全、跨模块协作 | PRD -> Research/ARCH -> 设计评审 -> DEV -> TEST -> 验收 |
-| XL | 多系统、多阶段、需求不确定、周期长 | 拆分为多个子项目，不允许一次性进入开发 |
-
-### 5.2 分级触发条件
-
-满足以下任一条件时，至少按 L 级处理：
+用户只和 PM 交互：
 
 ```text
-修改数据库 schema
-修改鉴权、权限、支付、风控、安全逻辑
-引入新的外部服务或关键依赖
-影响 CI/CD、部署、发布流程
-跨多个仓库或多个系统
-需要迁移历史数据
-需求目标不明确或存在多个产品方向
+创建项目；
+补充需求；
+确认 PRD；
+查看进度；
+处理异常升级；
+确认高风险动作；
+验收结果；
+暂停 / 恢复 / 取消项目。
 ```
 
-### 5.3 流程裁剪原则
+### 12.2 飞书按钮
+
+MVP 建议支持：
 
 ```text
-小需求减少文档和评审；
-中需求保证 PRD、开发、测试、验收闭环；
-大需求增加 Research、ARCH、Review；
-超大需求先拆分，不直接自动开发。
+确认 PRD；
+驳回 PRD；
+继续自动修复；
+转人工处理；
+修改需求；
+确认高风险操作；
+确认创建 PR / 推送分支；
+确认执行迁移；
+暂停项目；
+恢复项目；
+确认验收通过；
+验收不通过；
+取消项目。
 ```
 
----
-
-## 6. MVP 范围收敛
-
-### 5.1 第一版目标
-
-第一版目标不是完整模拟一个软件公司，而是跑通一个稳定闭环：
+飞书卡片按钮统一转成：
 
 ```text
-飞书用户
-  -> PM 创建项目
-  -> PDM 生成 PRD
-  -> 用户确认 PRD
-  -> DEV 编码实现
-  -> DEV 自测
-  -> TEST 执行验证清单
-  -> TEST 发现问题并创建 Issue
-  -> DEV 修复 Issue
-  -> TEST 复测
-  -> 全部通过
-  -> PM 通知用户验收
-  -> 用户确认完成
+confirmation decision
+project command
+status query
 ```
 
-### 5.2 第一版必须包含
+不允许 Feishu handler 直接写业务状态。
+
+### 12.3 PM 主动巡检
 
 ```text
-FastAPI 后端
-SQLite 数据库
-Project / Task / TaskRun
-Artifact
-Issue
-WorkflowEngine
-Runner Worker
-ClaudeCodeRunner
-WorkspaceManager
-Feishu webhook
-Feishu interactive card
-基础 Escalation
-PDM / DEV / TEST 三类角色 Prompt
+巡检周期：每 15 分钟扫描一次（可配置）
+巡检内容：
+  - running task 是否超时；
+  - failed task 是否未处理；
+  - open issue 是否卡住；
+  - review 是否超过 deadline；
+  - 项目是否等待用户确认；
+  - 回流次数是否超阈值。
+
+消息聚合规则（防止飞书轰炸）：
+  - 30 分钟内相同项目的相同状态问题，不重复推送；
+  - 只有以下情况才主动推送飞书消息：
+    a. 项目状态发生变化
+    b. Review 首次超时
+    c. 连续 2 次巡检发现同一任务超时（升级预警）
+    d. 创建 Escalation 需要用户决策
+    e. 等待用户确认且确认即将超时
+  - 用户可通过飞书 /status 命令随时查询，不受聚合规则限制
 ```
 
-### 5.3 第一版可以暂缓
+告警策略：
 
 ```text
-独立 ARCH Agent（已合并到 DEV，MVP 阶段 DEV 同时承担架构设计职责）
-独立 SEC Agent
-Researcher Agent 的完整 battle 系统
-复杂全员评审会议
-Excel 高级测试清单格式
-多租户权限系统
-成本统计
-绩效统计
-复杂模型路由
-多项目大规模并发
-Web 控制台
-OpenClaw / AutoGen / CrewAI 集成
-```
-
-### 5.4 MVP 成功标准
-
-MVP 成功的判断标准：
-
-```text
-1. 用户可以通过飞书创建一个项目。
-2. 系统可以生成 PRD 并请求用户确认。
-3. 用户确认后，DEV 可以通过 Claude Code CLI 修改代码。
-4. 系统可以保存代码 diff、自测报告、日志和产物记录。
-5. TEST 可以验证结果并生成问题。
-6. 问题可以回流给 DEV 修复。
-7. 重试超过阈值后可以升级给用户。
-8. 项目状态可以随时查询。
-9. 服务重启后项目可以继续推进。
+首次超时 -> 飞书提醒（受消息聚合规则约束）；
+连续 2 次超时 -> 飞书预警；
+超过回流次数限制 -> 创建 Escalation 并推送用户决策卡片。
 ```
 
 ---
 
-## 7. 推荐系统架构
+## 13. 数据模型建议
 
-### 6.1 总体架构
-
-```text
-Feishu User
-  |
-  v
-Feishu Bot / Webhook
-  |
-  v
-PM Interaction Layer
-  |
-  v
-Backend API / Modular Monolith
-  |
-  +--> ProjectService
-  +--> WorkflowEngine
-  +--> TaskService
-  +--> ArtifactService
-  +--> IssueService
-  +--> ReviewService
-  +--> EscalationManager
-  +--> AgentExecutor
-  |
-  v
-Task Queue
-  |
-  v
-Runner Worker Pool（默认 2 Worker，上限 4）
-  |
-  +--> Worker-1 / Worker-2（独立进程，各持有独立 workspace）
-  +--> WorkspaceManager
-  +--> PromptBuilder
-  +--> Claude Code CLI subprocess
-  +--> LogCollector
-  +--> ResultParser
-  +--> ArtifactCollector
-  |
-  v
-SQLite / File Storage / Git Workspace
-```
-
-### 6.1.1 Runner Worker Pool 配置
-
-```text
-默认并发数：2（同一项目同时最多 2 个 Runner 执行）
-最大并发数：4（受限于服务器 CPU / 内存 / API rate limit）
-超过上限的任务：进入 Task Queue 排队等待
-队列调度策略：优先级 = deadline > priority > created_at
-```
-
-典型并行场景：
-
-```text
-DESIGN_AND_TESTCASE_PREPARATION 阶段：
-  Worker-1 -> DEV 生成详细设计
-  Worker-2 -> TEST 编写测试用例
-
-DESIGN_REVIEW 阶段：
-  两个独立评审并行进行（各评审本身可内部并行）
-
-TESTING + SEC 并行验证阶段：
-  Worker-1 -> TEST 执行功能测试
-  Worker-2 -> SEC 执行安全扫描
-
-DESIGN_REVIEW 打回后的并行修订：
-  Worker-1 -> DEV 修订详细设计
-  Worker-2 -> TEST 修订测试用例
-```
-
-### 6.2 模块化单体优先
-
-MVP 阶段继续采用模块化单体：
-
-```text
-app/
-  core/
-  config/
-  agents/
-  projects/
-  tasks/
-  workflows/
-  artifacts/
-  issues/
-  reviews/
-  runners/
-  feishu/
-  escalations/
-  messaging/
-  security/
-  observability/
-```
-
-原因：
-
-```text
-访问量初期不大；
-业务状态复杂；
-模块化单体更容易保证事务一致性；
-后续可以按模块边界拆服务。
-```
-
----
-
-## 8. Workflow 设计
-
-### 7.1 MVP 阶段状态
-
-第一版建议先使用以下项目阶段：
-
-```text
-INIT
-REQUIREMENT_DRAFTING
-REQUIREMENT_USER_REVIEW
-REQUIREMENT_APPROVED
-DESIGN_AND_TESTCASE_PREPARATION
-DESIGN_REVIEW
-DESIGN_APPROVED
-DEVELOPMENT
-DEV_SELF_TEST
-TESTING
-FIXING
-USER_ACCEPTANCE
-SCOPE_CHANGE
-DONE
-PAUSED
-FAILED
-CANCELLED
-```
-
-### 7.2 核心流转
-
-```text
-INIT
-  -> REQUIREMENT_DRAFTING
-  -> REQUIREMENT_USER_REVIEW
-  -> REQUIREMENT_APPROVED
-  -> DESIGN_AND_TESTCASE_PREPARATION    (并行阶段：DEV 出详设，TEST 写测试用例)
-  -> DESIGN_REVIEW                      (并行阶段结束，两个独立评审并行进行)
-  -> DESIGN_APPROVED                    (两个评审均通过)
-  -> DEVELOPMENT
-  -> DEV_SELF_TEST
-  -> TESTING
-  -> USER_ACCEPTANCE
-  -> DONE
-```
-
-### 7.2.1 DESIGN_REVIEW 阶段：两个独立并行评审
-
-`DESIGN_REVIEW` 阶段内，WorkflowEngine 同时创建两个独立的 Review：
-
-```text
-Review A：详细设计评审
-  - 评审对象：DEV 产出的详细设计文档
-  - 参与 Agent：PM、PDM、TEST、SEC、ARCH（如已独立）
-  - 独立投票通过/打回
-
-Review B：测试用例与测试清单评审
-  - 评审对象：TEST 产出的测试用例文档 + 测试清单
-  - 参与 Agent：PM、PDM、DEV、SEC、ARCH（如已独立）
-  - 独立投票通过/打回
-```
-
-两个 Review 各自独立：
-- Review A 不通过 → DEV 修订详细设计 → 重新提交 Review A
-- Review B 不通过 → TEST 修订测试用例 → 重新提交 Review B
-- 双方都通过 → WorkflowEngine 推进到 `DESIGN_APPROVED`
-
-注意：此阶段 DEV 和 TEST 通信仍被 PhaseCommunicationGuard 阻断，各自只能与 PDM/PM 沟通澄清。
-
-### 7.2.2 评审超时机制
-
-每个 Review 设有超时时间（默认 15 分钟，可配置）。超时后的处理：
-
-```text
-1. PM 巡检发现 Review 超时
-2. PM 查询哪些 Agent 尚未提交评审意见
-3. PM 推送飞书通知用户，列出：
-   - 已提交评审意见的 Agent 及其结论
-   - 超时未响应的 Agent 列表
-4. 用户决策：
-   - 继续等待 15 分钟（延期一次，再次超时仍需用户决策）
-   - 跳过未响应 Agent，以已有意见为准
-   - 回退阶段重新来过
-```
-
-问题回流：
-
-```text
-TESTING
-  -> FIXING
-  -> DEV_SELF_TEST
-  -> TESTING
-```
-
-回流次数限制：
-
-```text
-TESTING <-> FIXING 回流最多 3 次
-DESIGN_REVIEW（每个独立评审）打回最多 3 次
-REQUIREMENT_USER_REVIEW 打回最多 2 次
-USER_ACCEPTANCE 打回最多 3 次
-超过次数强制 PAUSED，升级给用户人工介入
-```
-
-用户验收失败：
-
-```text
-USER_ACCEPTANCE
-  -> FIXING
-  -> DEV_SELF_TEST
-  -> TESTING
-  -> USER_ACCEPTANCE
-```
-
-需求变更：
-
-```text
-任意阶段（通常在 USER_ACCEPTANCE）
-  -> SCOPE_CHANGE
-  -> 用户确认变更范围
-  -> 影响评估（PDM / DEV / TEST）
-  -> 原阶段继续 或 REQUIREMENT_DRAFTING
-```
-
-异常升级：
-
-```text
-任意自动阶段
-  -> PAUSED
-  -> 用户决策
-  -> 恢复 / 改需求 / 人工介入 / 取消
-```
-
-### 7.3 阶段推进原则
-
-```text
-1. 只有 WorkflowEngine 可以推进阶段。
-2. 每次推进必须有 evidence。
-3. evidence 可以是 artifact、issue、review、task_run 或用户确认。
-4. 每次推进必须写 project_events。
-5. Agent 输出只能作为 evidence，不能直接作为状态变更。
-6. project_events 是项目状态重建的唯一真相源（Event Sourcing）。
-7. 服务重启后，通过重放 project_events 恢复项目状态。
-```
-
-### 7.4 Runner 与 Agent 解耦原则
-
-```text
-1. Runner 不知道自己是哪个 Agent（DEV / TEST / PDM）。
-2. Runner 只接收 task-prompt.md 和 task-context.json，不感知角色路由。
-3. 角色路由由上层 AgentExecutor 决定。
-4. Runner 与 Agent 之间通过 Task 和 Artifact 通信。
-5. Agent 之间不直接通信，所有交互通过 Task 和 Artifact 中转。
-```
-
----
-
-## 9. Runner 设计
-
-### 8.1 Runner 职责
-
-Runner 负责把系统任务转成 Claude Code CLI 可执行任务：
-
-```text
-创建 workspace
-准备输入上下文
-生成 task-prompt.md
-生成 task-context.json
-调用 claude CLI
-限制执行时间和资源
-收集 stdout / stderr
-收集 diff / 文档 / 测试报告
-解析执行结果
-回写 task_run
-登记 artifacts
-```
-
-### 8.2 Runner 生命周期
-
-```text
-CREATED
-  -> PREPARING_WORKSPACE
-  -> BUILDING_CONTEXT
-  -> RUNNING_CLAUDE
-  -> COLLECTING_RESULTS
-  -> PARSING_OUTPUT
-  -> COMPLETED / FAILED / TIMEOUT / CANCELLED
-```
-
-### 8.3 任务输入快照
-
-每个 task_run 启动前必须生成输入快照：
-
-```text
-task_context.json
-task_prompt.md
-input_artifacts_manifest.json
-repo_commit_sha
-workspace_path
-agent_config_snapshot
-model_config_snapshot
-runner_config_snapshot
-```
-
-目的：
-
-```text
-失败可复现；
-结果可审计；
-重试可对比；
-长期项目不会因为上下文变化而无法解释历史行为。
-```
-
-### 8.4 Workspace 策略
-
-| 任务类型 | 策略 | 写权限 |
-|---|---|---|
-| PDM 文档任务 | copy_workspace | docs / artifacts |
-| DEV 代码任务 | git_worktree | repo workspace |
-| TEST 测试任务 | clean_git_worktree | reports / artifacts，代码默认只读 |
-| SEC 安全任务 | readonly_worktree 或 container_readonly_mount | reports / artifacts |
-| PM 报告任务 | copy_workspace | reports / artifacts |
-
----
-
-## 10. Runner 安全、可靠性与交付门禁
-
-### 9.1 MVP 必须实现
-
-```text
-1. 每个 task_run 独立 workspace。
-2. 代码任务使用 git worktree 或容器目录。
-3. Runner 不能访问宿主敏感目录。
-4. API Key 只通过环境变量注入，不写入 prompt 和日志。
-5. 日志入库或落盘前做脱敏。
-6. 每个 task_run 必须有 timeout。
-7. 每个 task_run 必须有最大输出大小限制。
-8. 每个项目必须有并发上限。
-9. 每个任务必须有 retry 上限。
-10. Runner 只能回写指定 artifact 目录。
-11. 取消任务时必须能停止对应子进程。
-12. 失败必须记录 error_type 和 error_message。
-```
-
-### 9.2 建议尽早实现
-
-```text
-容器级隔离
-CPU / 内存限制
-磁盘配额
-网络访问开关
-命令 allowlist / denylist
-日志敏感信息扫描
-artifact 完整性校验
-workspace 自动清理策略
-```
-
-### 9.3 可延后实现
-
-```text
-复杂沙箱策略
-多租户隔离
-远程 Runner 集群
-细粒度 RBAC
-完整审计后台
-成本计量系统
-```
-
-### 10.4 代码交付边界
-
-MVP 阶段 Runner 默认只产出可审查结果，不直接执行外部可见交付动作。
-
-默认允许：
-
-```text
-生成 diff.patch
-生成代码修改分支或 workspace
-生成自测报告
-生成测试报告
-登记 artifact
-更新 task_run 状态
-```
-
-默认禁止：
-
-```text
-自动 push 到远端仓库
-自动 merge
-自动发布或部署
-自动修改 CI/CD 配置并生效
-自动执行数据库迁移
-自动删除远端分支
-```
-
-需要人工确认后才允许：
-
-```text
-创建 Pull Request
-推送代码分支
-执行迁移脚本
-修改 CI/CD
-发布部署
-删除文件或大规模重构
-新增外部依赖
-修改鉴权、权限、安全策略
-```
-
-### 10.5 人工确认门禁
-
-以下操作必须暂停自动推进，并通过飞书卡片或用户明确消息确认：
-
-```text
-需求范围变化
-PRD 最终确认
-用户验收结论
-修改数据库 schema
-执行数据库迁移
-修改鉴权、权限、支付、风控、安全逻辑
-删除文件或大规模重构
-新增外部依赖
-修改 CI/CD 或部署脚本
-推送代码到远端仓库
-创建 Pull Request
-发布或部署
-超过自动重试阈值
-Research Judge 无法收敛关键方案分歧
-```
-
-确认记录必须写入 project_events，并作为 WorkflowEngine 阶段推进的 evidence。
-
-### 10.6 上下文与记忆分层
-
-Hermes 需要区分长期记忆、项目记忆、任务快照和临时上下文，避免把短期执行细节污染长期记忆。
-
-| 层级 | 内容 | 生命周期 | 用途 |
-|---|---|---|---|
-| 长期记忆 | 用户偏好、团队规范、稳定技术约束 | 跨项目长期保留 | 影响 PM/PDM/DEV 的默认行为 |
-| 项目记忆 | PRD、设计、issue、决策记录、验收结论 | 项目生命周期内保留 | 支撑项目恢复、审计、复盘 |
-| 任务快照 | task_prompt、task_context、输入 artifact、commit sha、模型配置 | 每次 task_run 固化 | 支撑失败复现和重试对比 |
-| 临时上下文 | 单次 Claude Code CLI 会话上下文 | 单次任务结束后丢弃 | 支撑当前执行，不跨任务复用 |
-
-记忆写入原则：
-
-```text
-稳定偏好进入长期记忆；
-项目决策进入项目事件和 artifact；
-执行输入进入任务快照；
-临时推理和中间草稿默认不进入长期记忆。
-```
-
-### 10.7 质量门禁与验收准入
-
-进入用户验收前必须满足最低质量门槛：
-
-```text
-DEV 自测通过；
-TEST 验证清单全部通过，或存在明确用户/PM 豁免；
-严重 issue 数量为 0；
-Runner 没有未处理 failed / timeout 任务；
-必要 artifact 已登记；
-代码 diff 或 PR 摘要已生成；
-用户可读验收摘要已生成；
-高风险变更已完成对应人工确认。
-```
-
-如果不满足质量门禁，WorkflowEngine 不能进入 USER_ACCEPTANCE，只能回流 FIXING、TESTING 或升级给用户决策。
-
----
-
-## 11. 数据模型调整建议
-
-现有 DDL 方向基本合理，MVP 建议保留以下表：
+MVP 保留并增强：
 
 ```text
 projects
 project_events
 agents
+project_agents
 tasks
+task_contracts
 task_runs
+task_result_reviews
 artifacts
-issues
-escalations
-agent_messages
-```
-
-Review 相关表可保留，但第一版可以只做轻量能力：
-
-```text
 reviews
 review_comments
+issues
+test_checklists
+test_checklist_items
+escalations
+agent_messages
+confirmations
+runner_policies
 ```
 
-暂不需要复杂：
+关键增强方向：
 
 ```text
-review_rounds
-artifact_relations
-project_members
-cost_records
-permission tables
+projects 增加 workflow_template / size_level / current_round_json；
+project_events 增加 event_key / correlation_id / causation_id / evidence_json；
+project_agents 记录项目启用的 Agent、角色、配置快照和 prompt 版本；
+tasks 增加 task_type / runner_type / workspace_strategy / depends_on_json / risk_level；
+task_contracts 以 contract_json 为权威存储，常用字段只做查询索引，避免双写冲突；
+task_runs 增加 input_snapshot_path / task_contract_path / repo_commit_sha / model_config_snapshot_json / exit_code；
+artifacts 增加 source_task_run_id / checksum / content_type / size_bytes / is_final / parent_artifact_id；
+reviews 增加 required_participants_json / submitted_participants_json / deadline；
+issues 增加 source_task_run_id / fixed_by_task_id / verification_task_id / source_checklist_item_id；
+test_checklists 作为测试清单父表，test_checklist_items 记录逐条执行结果；
+confirmations 增加 timeout_minutes，便于与 API 请求保持一致；
+新增 confirmations 表承载人工确认；
+新增 runner_policies 表承载安全策略配置。
 ```
 
-### 10.1 task_runs 建议补充字段
-
-```text
-input_snapshot_path
-agent_config_snapshot_json
-model_config_snapshot_json
-runner_config_snapshot_json
-repo_commit_sha
-output_size_bytes
-timeout_seconds
-exit_code
-```
-
-### 10.2 artifacts 建议补充字段
-
-```text
-checksum
-source_task_run_id
-content_type
-size_bytes
-```
-
-### 10.3 issues 建议明确来源
-
-issue.source 建议固定为：
-
-```text
-test
-security
-acceptance
-runner
-workflow
-user
-```
-
-### 11.4 research task 建议补充字段
-
-Research Agent 调研池可以先复用 tasks 表，通过 task.type 或 owner_agent 区分。后续如调研频繁，可独立 research_tasks 表。
-
-建议补充字段：
-
-```text
-research_question
-research_dimensions_json
-candidate_direction
-judge_agent
-evidence_artifacts_json
-recommendation
-confidence
-budget_limit
-started_at
-completed_at
-```
-
-### 11.5 人工确认记录建议
-
-人工确认可以先复用 project_events，事件类型建议包括：
-
-```text
-user_confirmed_prd
-user_rejected_prd
-user_approved_delivery
-user_rejected_delivery
-user_approved_risky_action
-user_requested_scope_change
-user_confirmed_escalation_decision
-```
+详细 DDL 以 `database-ddl-v0.1.md` 为准。
 
 ---
 
-## 12. API 调整建议
-
-当前 API 设计可继续使用，MVP 建议优先实现：
+## 14. API 设计原则
 
 ```text
-POST /api/projects
-GET /api/projects/{project_id}
-GET /api/projects/{project_id}/status
-POST /api/projects/{project_id}/pause
-POST /api/projects/{project_id}/resume
-
-POST /api/projects/{project_id}/tasks
-GET /api/projects/{project_id}/tasks
-POST /api/tasks/{task_id}/start
-POST /api/tasks/{task_id}/retry
-POST /api/tasks/{task_id}/cancel
-
-POST /api/runner/task-runs
-GET /api/runner/task-runs/{task_run_id}
-POST /api/runner/task-runs/{task_run_id}/cancel
-
-POST /api/projects/{project_id}/artifacts
-GET /api/projects/{project_id}/artifacts
-
-GET /api/projects/{project_id}/issues
-POST /api/projects/{project_id}/issues
-POST /api/issues/{issue_id}/resolve
-POST /api/issues/{issue_id}/reopen
-
-POST /api/feishu/events
-POST /api/feishu/interactive
-
-GET /api/projects/{project_id}/escalations
-POST /api/escalations/{escalation_id}/decision
+外部 API 表达用户意图；
+内部服务决定能不能执行；
+WorkflowEngine 决定状态是否推进；
+Runner API 只服务受控执行，不暴露给普通用户。
 ```
 
-Workflow 的外部 API 要谨慎：
+公开 API 不应允许外部任意调用：
 
 ```text
-POST /api/projects/{project_id}/workflow/advance
-POST /api/projects/{project_id}/workflow/reject
+POST /workflow/advance
+POST /workflow/reject
 ```
 
-这些接口不应允许外部任意推进状态，只能用于受控操作，并且必须经过 StateTransitionGuard。
+推荐改为语义接口：
+
+```text
+提交确认；
+提交评审；
+完成任务；
+验证 issue；
+登记产物；
+提交 Runner 结果。
+```
+
+详细 API 以 `api-design-v0.1.md` 为准。
 
 ---
 
-## 13. 飞书交互设计
-
-### 12.1 用户只和 PM 交互
-
-用户入口保持简单：
-
-```text
-创建项目
-补充需求
-确认 PRD
-查看进度
-处理异常升级
-验收结果
-暂停 / 恢复 / 取消项目
-```
-
-### 12.2 PM 主动通知场景
-
-```text
-PRD 待确认
-任务开始执行
-开发完成并进入测试
-测试发现问题
-连续失败超过阈值
-需要用户决策
-等待用户验收
-项目完成
-项目暂停或取消
-```
-
-### 12.3 PM 主动巡检机制
-
-PM 不是被动传声筒，需具备主动巡检能力：
-
-```text
-巡检周期：每 15 分钟扫描一次（可配置）
-巡检内容：
-  - 是否有 pending / assigned 任务超过 deadline
-  - 是否有 running 任务超过预期时长（超时预警）
-  - 是否有 failed / timeout 任务未被处理
-  - 是否有 open issue 超过 2 轮未修复
-  - 是否有 review 等待超过 30 分钟
-  - 项目是否处于 PAUSED 状态超过 1 天
-告警策略：
-  - 首次超时 → 推送飞书提醒（不升级给用户）
-  - 连续 2 次超时 → 推送飞书预警（附建议操作）
-  - 超过回流次数限制 → 自动触发 Escalation，推送用户决策卡片
-```
-
-### 12.4 飞书卡片按钮
-
-MVP 建议支持：
-
-```text
-确认 PRD
-驳回 PRD
-继续自动修复
-转人工处理
-修改需求
-确认高风险操作
-确认创建 PR / 推送分支
-确认执行迁移
-暂停项目
-恢复项目
-确认验收通过
-验收不通过
-取消项目
-```
-
----
-
-## 14. 第一阶段目录结构建议
+## 15. 第一阶段目录结构建议
 
 ```text
 ccHermesAgents/
   app/
     main.py
-
     core/
-      database.py
-      logging.py
-      settings.py
-      ids.py
-      time.py
-
     config/
-      loader.py
-      model_resolver.py
-      agent_resolver.py
-
     agents/
       registry.py
       prompt_builder.py
@@ -1194,96 +1360,52 @@ ccHermesAgents/
         pdm.yaml
         dev.yaml
         test.yaml
+        arch.yaml
+        sec.yaml
         research.yaml
         research_judge.yaml
-
     projects/
-      models.py
-      schemas.py
-      service.py
-      router.py
-
     workflows/
       phases.py
       state_machine.py
       guards.py
       phase_communication_rules.yaml
       engine.py
-
     tasks/
-      models.py
-      schemas.py
-      service.py
-      router.py
-
     runners/
-      models.py
-      schemas.py
-      router.py
       worker.py
       claude_code_runner.py
+      direct_llm_runner.py
+      script_runner.py
       workspace_manager.py
-      prompt_builder.py
       result_parser.py
       artifact_collector.py
       log_collector.py
-
     artifacts/
-      models.py
-      schemas.py
-      service.py
-      router.py
-
     issues/
-      models.py
-      schemas.py
-      service.py
-      router.py
-
+    reviews/
+    confirmations/
     escalations/
-      models.py
-      schemas.py
-      service.py
-      router.py
-
     feishu/
-      router.py
-      client.py
-      parser.py
-      card_builder.py
-      handlers.py
-
     messaging/
-      models.py
-      service.py
-
     observability/
-      events.py
-      metrics.py
-
   configs/
     app.yaml
     agents.yaml
     models.yaml
-
+    runner_policies.yaml
   docs/
     designs/
     prd/
     test-reports/
     security-reports/
-
   scripts/
-    dev.sh
-    worker.sh
-
   tests/
 ```
 
 ---
 
-## 15. 推荐技术栈
-
-MVP 推荐：
+## 16. 推荐技术栈
 
 ```text
 语言：Python
@@ -1306,313 +1428,134 @@ Runner：subprocess 调 Claude Code CLI
 FastAPI + SQLite + SQLAlchemy + Dramatiq + Docker Compose
 ```
 
-说明：
-
-```text
-SQLite 适合个人和小团队第一版；
-Dramatiq / RQ 比 Celery 更轻；
-Docker Compose 足够支撑单机 Runner Worker；
-后续需要多项目并发时再迁移 Postgres 和分布式队列。
-```
-
 ---
 
-## 16. 落地路线
+## 17. 路线图
 
-### 16.1 Phase 0：执行边界验证
+### Phase 0：Runner 安全执行验证
 
-目标：先验证 Claude Code CLI Runner 在 Linux 服务器上的最小安全执行能力。
-
-范围：
-
-```text
-本地 Git 仓库 workspace 创建
-Claude Code CLI subprocess 调用
-timeout 生效
-日志收集和脱敏
-最大输出限制
-artifact 目录写入限制
-取消任务时停止子进程
-```
-
-验收标准：
-
-```text
-Runner 能执行一个只读文档任务；
-Runner 能执行一个代码 diff 任务；
-Runner 不会写出指定 workspace 和 artifact 目录；
-失败、超时、取消都能正确记录 task_run。
-```
-
-### 16.2 Phase 1：基础控制面
-
-目标：系统能创建项目、创建任务、调用 Runner、记录结果。
+目标：只证明 Claude Code CLI 可以被安全、可控、可恢复地作为 Runner 后端。
 
 范围：
 
 ```text
-FastAPI 项目骨架
-SQLite 初始化
-Project / Task / TaskRun / Artifact 表
-WorkflowEngine 基础状态机
-Runner Worker
-ClaudeCodeRunner
-WorkspaceManager
-基础日志和错误记录
+task_prompt.md；
+task_context.json；
+task_contract.json；
+workspace 创建；
+subprocess 调用；
+timeout；
+cancel；
+日志收集；
+diff 收集；
+artifact 收集；
+失败记录；
+contract check。
 ```
 
-验收标准：
+### Phase 1：最小控制面
 
-```text
-可以手动创建一个任务；
-Runner 可以调用 Claude Code CLI；
-执行日志和产物可以登记；
-任务状态可以从 running 变成 completed / failed。
-```
-
-### 16.3 Phase 2：飞书 PM 入口
-
-目标：用户可以通过飞书驱动项目。
+目标：项目、任务、契约、执行和产物可以被结构化管理。
 
 范围：
 
 ```text
-Feishu webhook
-Feishu interactive card
-PM 消息解析
-项目创建命令
-项目状态查询
-PRD 确认卡片
-异常升级卡片
+Project；
+Task；
+TaskContract；
+TaskRun；
+Artifact；
+Runner Worker；
+基础 Runner Policy；
+不做完整 Review；
+不接飞书；
+不做多角色完整闭环。
 ```
 
-验收标准：
+### Phase 2：本地最小闭环
 
-```text
-用户可以通过飞书创建项目；
-系统可以推送 PRD 待确认卡片；
-用户点击确认后 WorkflowEngine 推进阶段。
-```
-
-### 16.4 Phase 3：PRD -> DEV 闭环
-
-目标：从需求到开发自测跑通。
+目标：不依赖飞书，先跑通 PDM -> DEV -> TEST -> Issue -> Fix -> Result Review。
 
 范围：
 
 ```text
-PDM Agent Prompt
-PRD Artifact
-DEV Agent Prompt
-代码 workspace
-自测报告 Artifact
-diff Artifact
+PDM Agent；
+DEV Agent；
+TEST Agent；
+PRD artifact；
+diff artifact；
+test report；
+issue 回流；
+result review；
+使用本地命令或内部 API 驱动。
 ```
 
-验收标准：
+### Phase 3：飞书 PM 入口
 
-```text
-PDM 能生成 PRD；
-用户确认 PRD；
-DEV 能基于 PRD 修改代码；
-系统能保存 diff 和自测结果。
-```
-
-### 16.5 Phase 4：TEST -> Issue -> DEV 修复闭环
-
-目标：测试发现问题后能回流开发修复。
+目标：用户只通过飞书和 PM Agent 交互。
 
 范围：
 
 ```text
-TEST Agent Prompt
-测试清单 Artifact
-Issue 模型
-Issue 回流 Workflow
-DEV 修复任务
-TEST 复测任务
+Feishu event；
+Feishu interactive card；
+Confirmation；
+项目创建；
+状态查询；
+PRD 确认；
+验收确认；
+异常升级。
 ```
 
-验收标准：
+### Phase 4：评审、巡检与升级
 
-```text
-TEST 失败会创建 Issue；
-WorkflowEngine 会创建 DEV 修复任务；
-DEV 修复后 TEST 能复测；
-全部通过后进入用户验收。
-```
-
-### 16.6 Phase 5：安全与扩展
-
-目标：增强 Runner 安全和项目稳定性。
+目标：支持需求评审、设计评审、测试用例评审、PM 主动巡检和超时预警。
 
 范围：
 
 ```text
-Runner 容器隔离
-资源限制
-日志脱敏
-SEC Agent
-SAST 集成
-Review 模块增强
-多项目并发控制
-Postgres 迁移准备
+Requirement Review；
+Design Review；
+Test Review；
+ReviewComment；
+Escalation；
+PM Patrol Scheduler；
+设计/测试用例评审。
 ```
 
----
+### Phase 5：质量增强与研究能力
 
-## 17. 后续可扩展方向
+目标：扩展 ARCH、SEC、RES，提高复杂项目质量。
 
-### 16.1 引入独立 ARCH Agent
-
-适合在以下条件满足后引入：
+范围：
 
 ```text
-PRD -> DEV -> TEST 已稳定；
-项目复杂度上升；
-需要接口设计、数据库设计、技术选型沉淀。
+ARCH Agent；
+SEC Agent；
+SAST；
+dependency scan；
+Research Agent pool；
+Research Judge；
+多方案比较；
+安全报告。
 ```
-
-### 16.2 引入 SEC Agent
-
-适合在以下条件满足后引入：
-
-```text
-Runner 隔离已经完成；
-项目开始处理真实代码仓库；
-需要依赖扫描、SAST、敏感信息扫描。
-```
-
-### 16.3 引入 Research Agent 调研池
-
-适合在以下条件满足后增强：
-
-```text
-PRD -> DEV -> TEST 闭环已稳定；
-需求经常出现技术选型或竞品分析；
-需要降低单个 Agent 调研偏差；
-需要为方案决策保留可审计依据。
-```
-
-推荐实现方式：
-
-```text
-Research Agent 按需派生多个实例；
-每个实例独立调研一个方向；
-Research Judge 汇总 battle 结果；
-最终输出 research_report artifact；
-ARCH / PDM / PM 对最终方案负责。
-```
-
-### 16.4 引入 Multi-agent 框架
-
-后续可以把 OpenClaw / AutoGen / CrewAI 作为 AgentExecutor 的一种实现：
-
-```text
-AgentExecutor
-  +--> ClaudeCodeCliExecutor
-  +--> DirectLlmExecutor
-  +--> MultiAgentExecutor
-```
-
-但即使引入，也不能让 multi-agent 框架直接接管项目状态。
 
 ---
 
 ## 18. 最终建议
 
-本项目应优先建设为：
+优先建设：
 
 ```text
 状态机驱动的多角色软件工程团队平台，
 而不是自由对话式 multi-agent 实验平台。
 ```
 
-第一版的目标应该是小而闭环：
-
-```text
-飞书创建项目
-PRD 生成与确认
-DEV 编码
-TEST 验证
-Issue 回流
-用户验收
-项目完成
-```
-
-只要这个闭环稳定，后续再逐步加入：
-
-```text
-ARCH
-SEC
-RES 调研池
-复杂评审
-多项目并发
-成本统计
-Web 控制台
-Multi-agent 框架适配
-```
-
-最关键的设计原则：
+最关键设计原则：
 
 ```text
 Agent 负责产出，WorkflowEngine 负责决策；
 Runner 负责执行，Hermes 负责状态；
-飞书负责交互，Artifact 负责沉淀。
-```
-
----
-
-## 19. v1.7 变更记录
-
-基于需求评审讨论，v1.7 相比 v1.6 的主要变更：
-
-### 新增模块
-
-```text
-PhaseCommunicationGuard
-  - 按阶段控制 Agent 间通信权限
-  - DESIGN_AND_TESTCASE_PREPARATION 阶段 DEV ↔ TEST 硬隔离
-  - 被拦截消息记录到 agent_messages（status = rejected_by_guard）
-  - 规则配置于 workflows/phase_communication_rules.yaml
-```
-
-### 角色调整
-
-```text
-ARCH → 合并到 DEV（MVP 阶段）
-  - DEV 同时承担编码和架构设计职责
-  - ARCH 角色定义保留，后续版本可独立拆分
-```
-
-### 流程调整
-
-```text
-DESIGN_REVIEW 拆分为两个独立并行评审
-  - Review A：详细设计评审（PM、PDM、TEST、SEC）
-  - Review B：测试用例与测试清单评审（PM、PDM、DEV、SEC）
-  - 两个评审独立投票通过/打回，双方均通过才推进
-
-评审超时机制
-  - 每个 Review 默认 15 分钟超时
-  - 超时后 PM 推送用户决策（延期 15 分钟 / 跳过 / 回退）
-
-回流次数补充
-  - USER_ACCEPTANCE 打回最多 3 次
-  - 原 TESTING <-> FIXING（3次）、DESIGN_REVIEW 打回（3次）、
-    REQUIREMENT_USER_REVIEW 打回（2次）不变
-```
-
-### Agent 模型配置
-
-```text
-每个 Agent 独立配置 OpenAI 兼容格式模型（base_url + api_key + model）
-不同 Agent 可选不同厂商模型
-Hermes 自身模型与 Agent 执行模型分开管理
-```
-
-### 调研触发
-
-```text
-RES 调研不限定特定阶段，任何 Agent 在任何阶段均可向 PM 发起调研请求
+飞书负责交互，Artifact 负责沉淀；
+Task Contract 约束 Runner，Result Review 验证 Agent 意图是否被正确实现。
 ```
