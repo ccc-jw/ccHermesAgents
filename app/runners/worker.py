@@ -8,6 +8,7 @@ from app.models.task_contract import TaskContract as TaskContractModel
 from app.models.task_run import TaskRun
 from app.runners.artifact_collector import ArtifactCollector
 from app.runners.claude_code_runner import ClaudeCodeRunner
+from app.runners.openai_runner import OpenAICompatibleRunner
 from app.runners.types import RunnerResult, RunnerStatus, TaskContract
 from app.runners.workspace_manager import WorkspaceManager
 
@@ -21,9 +22,14 @@ class RunnerWorker:
         workspace_manager: WorkspaceManager | None = None,
     ):
         self.settings = settings or Settings()
-        self.runner = runner or ClaudeCodeRunner()
+        self.runner = runner or self._default_runner()
         self.artifact_collector = artifact_collector or ArtifactCollector()
         self.workspace_manager = workspace_manager or WorkspaceManager(self.settings.storage_root)
+
+    def _default_runner(self) -> ClaudeCodeRunner | OpenAICompatibleRunner:
+        if self.settings.runner_api_base_url and self.settings.runner_model:
+            return OpenAICompatibleRunner(self.settings)
+        return ClaudeCodeRunner()
 
     def execute_task_run(self, session: Session, task_run_id: str) -> RunnerResult:
         task_run = session.get(TaskRun, task_run_id)
@@ -37,7 +43,12 @@ class RunnerWorker:
 
             contract = TaskContract.model_validate_json(contract_row.contract_json)
             workspace = self.workspace_manager.prepare_workspace(task_run.project_id, task_run.id)
-            self._update_run(session, task_run, RunnerStatus.PREPARING_WORKSPACE, workspace_path=str(workspace.root))
+            self._update_run(
+                session,
+                task_run,
+                RunnerStatus.PREPARING_WORKSPACE,
+                workspace_path=str(workspace.root),
+            )
             self._update_run(session, task_run, RunnerStatus.RUNNING)
             result = self.runner.run(
                 workspace=workspace,

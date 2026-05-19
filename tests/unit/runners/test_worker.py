@@ -11,6 +11,7 @@ from app.models.project import Project
 from app.models.task import Task
 from app.models.task_contract import TaskContract
 from app.models.task_run import TaskRun
+from app.runners.openai_runner import OpenAICompatibleRunner
 from app.runners.types import RunnerResult, RunnerStatus
 from app.runners.worker import RunnerWorker
 
@@ -42,7 +43,15 @@ def build_session():
 
 def seed_run(session):
     now = utc_now_iso()
-    session.add(Project(id="proj_1", name="Demo", owner_user_id="user_1", created_at=now, updated_at=now))
+    session.add(
+        Project(
+            id="proj_1",
+            name="Demo",
+            owner_user_id="user_1",
+            created_at=now,
+            updated_at=now,
+        )
+    )
     session.add(
         Task(
             id="task_1",
@@ -62,7 +71,13 @@ def seed_run(session):
         task_goal="Implement login",
         role="DEV",
         phase="DEVELOPMENT",
-        contract_json=json.dumps({"task_goal": "Implement login", "role": "DEV", "phase": "DEVELOPMENT"}),
+        contract_json=json.dumps(
+            {
+                "task_goal": "Implement login",
+                "role": "DEV",
+                "phase": "DEVELOPMENT",
+            }
+        ),
         created_by="PM",
         created_at=now,
     )
@@ -99,11 +114,26 @@ def test_runner_worker_persists_success_result_and_artifacts(tmp_path):
         assert artifact.name == "result.txt"
 
 
+def test_runner_worker_uses_openai_runner_when_api_is_configured(tmp_path):
+    worker = RunnerWorker(
+        settings=Settings(
+            storage_root=str(tmp_path),
+            runner_api_base_url="https://example.test/v1",
+            runner_model="test-model",
+        )
+    )
+
+    assert isinstance(worker.runner, OpenAICompatibleRunner)
+
+
 def test_runner_worker_persists_exception_failure(tmp_path):
     Session = build_session()
     with Session() as session:
         seed_run(session)
-        worker = RunnerWorker(settings=Settings(storage_root=str(tmp_path)), runner=ExplodingRunner())
+        worker = RunnerWorker(
+            settings=Settings(storage_root=str(tmp_path)),
+            runner=ExplodingRunner(),
+        )
 
         result = worker.execute_task_run(session, "run_1")
 
