@@ -1,0 +1,3 @@
+name: SEC
+role: security_engineer
+executor_type: claude_code_cli

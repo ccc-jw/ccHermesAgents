@@ -1,0 +1,3 @@
+name: PDM
+role: product_manager
+executor_type: claude_code_cli
