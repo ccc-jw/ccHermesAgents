@@ -1,10 +1,11 @@
+from app.models.project import Project
+from tests.integration.helpers import build_test_app
 from fastapi.testclient import TestClient
 
-from app.main import create_app
 
-
-def test_create_project_returns_init_phase():
-    client = TestClient(create_app())
+def test_create_project_returns_init_phase(tmp_path):
+    app, session_factory = build_test_app(tmp_path)
+    client = TestClient(app)
     response = client.post(
         "/api/projects",
         json={
@@ -24,3 +25,8 @@ def test_create_project_returns_init_phase():
     assert body["success"] is True
     assert body["data"]["status"] == "active"
     assert body["data"]["current_phase"] == "INIT"
+
+    with session_factory() as session:
+        project = session.get(Project, body["data"]["id"])
+        assert project is not None
+        assert project.name == "Login"

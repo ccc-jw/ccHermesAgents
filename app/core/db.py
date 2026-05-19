@@ -11,6 +11,8 @@ class Base(DeclarativeBase):
 
 
 def create_session_factory(settings: Settings) -> sessionmaker[Session]:
+    import app.models  # noqa: F401
+
     engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
